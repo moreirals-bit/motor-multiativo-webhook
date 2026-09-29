@@ -117,12 +117,12 @@ def _mult_r(alvo, entrada, stop):
     return abs(a - e) / abs(e - s)
 
 
-_NIVEL_CONF = {"GRANDE": "GRANDE", "MEDIA": "MÃ‰DIA", "BAIXA": "BAIXA"}
+_NIVEL_CONF = {"GRANDE": "GRANDE", "MEDIA": "M\u00c9DIA", "BAIXA": "BAIXA"}
 _ITEM_CONF = {
     "score": "score forte",
     "timing": "timing confirmado",
-    "amostra": "amostra mÃ­nima",
-    "ExpR": "expectÃ¢ncia do plano > 0",
+    "amostra": "amostra m\u00ednima",
+    "ExpR": "expect\u00e2ncia do plano > 0",
     "prob1": "prob. do Alvo 1",
 }
 
@@ -132,7 +132,7 @@ def _montar_mensagem(payload: dict, dentro_do_teto: bool, risco_pos_sinal: float
     ativo = payload["ativo"]
     eh_compra = payload["direcao"].lower().startswith("c") or payload["direcao"].lower() == "buy"
     direcao = "COMPRA" if eh_compra else "VENDA"
-    icone = "ðŸŸ¢" if eh_compra else "ðŸ”´"
+    icone = "\U0001f7e2" if eh_compra else "\U0001f534"
     score = payload["score"]
     timing = "confirmado" if payload["timing_confirmado"] else "pendente"
     amostra_atual = payload["amostra_atual"]
@@ -146,13 +146,13 @@ def _montar_mensagem(payload: dict, dentro_do_teto: bool, risco_pos_sinal: float
     tf_mare = _tf_txt(payload.get("tf_mare"))  # so existe a partir do Pine v1.5
 
     # 1) cabecalho: direcao, ativo e tempo grafico analisado
-    cabecalho = f"{icone} {direcao} â€” {ativo}"
+    cabecalho = f"{icone} {direcao} \u2014 {ativo}"
     if tf:
-        cabecalho += f" | grÃ¡fico {tf}"
+        cabecalho += f" | gr\u00e1fico {tf}"
         if tf_mare:
-            cabecalho += f" (marÃ© {tf_mare})"
+            cabecalho += f" (mar\u00e9 {tf_mare})"
     if amostra_atual < amostra_exigida:
-        cabecalho += " â€” SÃ“ OBSERVAÃ‡ÃƒO (amostra curta)"
+        cabecalho += " \u2014 S\u00d3 OBSERVA\u00c7\u00c3O (amostra curta)"
     linhas = [cabecalho]
 
     # 2) confianca: checklist do motor, NAO e probabilidade de lucro (so v1.5)
@@ -160,7 +160,7 @@ def _montar_mensagem(payload: dict, dentro_do_teto: bool, risco_pos_sinal: float
     if nivel:
         pts = payload.get("confianca_pontos")
         pts_txt = f" ({pts}/5)" if isinstance(pts, (int, float)) and not isinstance(pts, bool) else ""
-        linha = f"ConfianÃ§a: {nivel}{pts_txt} â€” checklist do motor, nÃ£o Ã© chance de lucro."
+        linha = f"Confian\u00e7a: {nivel}{pts_txt} \u2014 checklist do motor, n\u00e3o \u00e9 chance de lucro."
         faltam = [_ITEM_CONF.get(x, x) for x in str(payload.get("confianca_faltam", "")).split() if x]
         if faltam:
             linha += " Falta: " + ", ".join(faltam) + "."
@@ -171,9 +171,9 @@ def _montar_mensagem(payload: dict, dentro_do_teto: bool, risco_pos_sinal: float
     stop = _num(payload.get("stop"))
     if entrada is not None and stop is not None:
         if eh_compra:
-            linhas.append(f"Entrada: comprar ao romper {_fmt_preco(entrada)} (mÃ¡xima do candle do sinal)")
+            linhas.append(f"Entrada: comprar ao romper {_fmt_preco(entrada)} (m\u00e1xima do candle do sinal)")
         else:
-            linhas.append(f"Entrada: vender ao romper {_fmt_preco(entrada)} (mÃ­nima do candle do sinal)")
+            linhas.append(f"Entrada: vender ao romper {_fmt_preco(entrada)} (m\u00ednima do candle do sinal)")
         linhas.append(f"Stop: {_fmt_preco(stop)} (lado oposto do mesmo candle)")
 
     # 4) saidas parciais e saida final
@@ -191,47 +191,47 @@ def _montar_mensagem(payload: dict, dentro_do_teto: bool, risco_pos_sinal: float
         r2 = _mult_r(alvo2, entrada, stop)
         r1_txt = f"{r1:g}R, " if r1 is not None else ""
         r2_txt = f"{r2:g}R, " if r2 is not None else ""
-        acao1 = f" â†’ realizar {pct1:.0f}%" if pct1 is not None else ""
-        acao2 = f" â†’ realizar {pct2:.0f}%" if pct2 is not None else ""
-        linhas.append(f"Parcial 1 (Alvo 1): {_fmt_preco(alvo1)} ({r1_txt}prob. histÃ³rica: {prob1_txt}){acao1}")
-        linhas.append(f"Parcial 2 (Alvo 2): {_fmt_preco(alvo2)} ({r2_txt}prob. histÃ³rica: {prob2_txt}){acao2}")
+        acao1 = f" \u2192 realizar {pct1:.0f}%" if pct1 is not None else ""
+        acao2 = f" \u2192 realizar {pct2:.0f}%" if pct2 is not None else ""
+        linhas.append(f"Parcial 1 (Alvo 1): {_fmt_preco(alvo1)} ({r1_txt}prob. hist\u00f3rica: {prob1_txt}){acao1}")
+        linhas.append(f"Parcial 2 (Alvo 2): {_fmt_preco(alvo2)} ({r2_txt}prob. hist\u00f3rica: {prob2_txt}){acao2}")
         if pct1 is not None and pct2 is not None:
             resto = max(0.0, 100.0 - float(pct1) - float(pct2))
             linhas.append(
-                f"SaÃ­da final ({resto:.0f}%): depois da Parcial 1, stop na entrada; sair do restante quando o painel do "
-                f"indicador mostrar SAÃDA (Kick ADX, ADX fraco, BB fechando, TRIX/EstocÃ¡stico contra) ou no stop."
+                f"Sa\u00edda final ({resto:.0f}%): depois da Parcial 1, stop na entrada; sair do restante quando o painel do "
+                f"indicador mostrar SA\u00cdDA (Kick ADX, ADX fraco, BB fechando, TRIX/Estoc\u00e1stico contra) ou no stop."
             )
             linhas.append(
-                f"Parciais {pct1:.0f}/{pct2:.0f}/{resto:.0f}% e alvos em R: sugestÃ£o prÃ³pria editÃ¡vel â€” NÃƒO Ã© regra documentada "
-                f"de Velez/Didi (sÃ³ o CONCEITO de 'sair em partes' Ã© real)."
+                f"Parciais {pct1:.0f}/{pct2:.0f}/{resto:.0f}% e alvos em R: sugest\u00e3o pr\u00f3pria edit\u00e1vel \u2014 N\u00c3O \u00e9 regra documentada "
+                f"de Velez/Didi (s\u00f3 o CONCEITO de 'sair em partes' \u00e9 real)."
             )
 
     # 5) preco medio (2a entrada OPCIONAL, so v1.5)
     preco_medio = _num(payload.get("preco_medio"))
     if preco_medio is not None:
-        linha = f"PreÃ§o mÃ©dio (opcional): {_fmt_preco(preco_medio)}, mesmo stop"
+        linha = f"Pre\u00e7o m\u00e9dio (opcional): {_fmt_preco(preco_medio)}, mesmo stop"
         if entrada is not None:
-            linha += f". Dividindo o tamanho meio a meio, a posiÃ§Ã£o fica em â‰ˆ {_fmt_preco((entrada + preco_medio) / 2)}"
-        linha += ". SugestÃ£o prÃ³pria, sem teste; nunca some tamanho alÃ©m do Kelly."
+            linha += f". Dividindo o tamanho meio a meio, a posi\u00e7\u00e3o fica em \u2248 {_fmt_preco((entrada + preco_medio) / 2)}"
+        linha += ". Sugest\u00e3o pr\u00f3pria, sem teste; nunca some tamanho al\u00e9m do Kelly."
         linhas.append(linha)
 
     # 6) numeros do motor (como antes)
     linhas += [
         # Score: v1 era inteiro 0-4; na v1.2+ o score e continuo e pode passar de 4 - por isso so mostra o numero.
         f"Score: {score:.2f} | Timing (Velez): {timing}",
-        f"Amostra: {amostra_atual}/{amostra_exigida} | Taxa histÃ³rica: {taxa:.0%} | ExpectÃ¢ncia: {expect:.2f}R",
+        f"Amostra: {amostra_atual}/{amostra_exigida} | Taxa hist\u00f3rica: {taxa:.0%} | Expect\u00e2ncia: {expect:.2f}R",
         f"Tamanho sugerido (Kelly ajustado): {kelly:.2f}% do capital",
     ]
 
     if not dentro_do_teto:
         linhas.append(
-            f"âš ï¸ Fora do teto de risco agregado ({risco_pos_sinal:.1f}% > {TETO_RISCO_AGREGADO_PCT:.1f}%) "
-            f"â€” sinal informativo, nÃ£o somar posiÃ§Ã£o nova agora."
+            f"\u26a0\ufe0f Fora do teto de risco agregado ({risco_pos_sinal:.1f}% > {TETO_RISCO_AGREGADO_PCT:.1f}%) "
+            f"\u2014 sinal informativo, n\u00e3o somar posi\u00e7\u00e3o nova agora."
         )
     if aviso_classe:
         linhas.append(f"Aviso: {aviso_classe}")
     if amostra_atual < amostra_exigida:
-        linhas.append("Aviso: amostra ainda insuficiente â€” tratar como observaÃ§Ã£o, nÃ£o como sinal validado.")
+        linhas.append("Aviso: amostra ainda insuficiente \u2014 tratar como observa\u00e7\u00e3o, n\u00e3o como sinal validado.")
 
     return "\n".join(linhas)
 
