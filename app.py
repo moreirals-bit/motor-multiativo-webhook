@@ -17,6 +17,9 @@ taxa historica, expectancia, Kelly). O servidor so orquestra a ENTREGA:
   5) registro no Notion
 A execucao da ordem continua 100% manual, sempre com voce.
 
+Patch v1.6.1: alertas com tipo == "saida" sao tratados ANTES da validacao de
+entrada (nao trazem score, timing_confirmado, taxa_acerto, expectancia).
+
 Deploy sugerido: Render/Railway (free tier) ou uma VPS pequena. Nao rode isso
 no celular - precisa de processo continuo em background, o que apps moveis
 nao sustentam de forma confiavel.
@@ -58,7 +61,7 @@ def _risco_agregado_atual() -> float:
     return sum(s["kelly_pct"] for s in _janela_sinais)
 
 
-# --------------------------- VALIDACAO DO PAYLOAD ---------------------------
+# --------------------------- VALIDACAO DO PAYLOAD (ENTRADA) ---------------------------
 CAMPOS_OBRIGATORIOS = [
     "ativo", "direcao", "score", "timing_confirmado",
     "amostra_atual", "amostra_exigida", "taxa_acerto", "expectancia", "kelly_pct",
@@ -73,66 +76,52 @@ def _validar_payload(payload: dict):
         raise HTTPException(status_code=401, detail="Segredo do webhook invalido")
 
 
-# --------------------------- FORMATACAO (v1.5) ---------------------------
-def _num(v):
-    """Numero valido ou None. O Pine (v1.4 e v1.5) manda 0 quando o valor nao existe (na); por isso 0 conta como ausente."""
-    if v is None or isinstance(v, bool):
-        return None
-    try:
-        x = float(v)
-    except (TypeError, ValueError):
-        return None
-    if x != x or x == 0.0:
-        return None
-    return x
+# --------------------------- VALIDACAO E MENSAGEM (SAIDA) - Patch v1.6.1 ---------------------------
+CAMPOS_SAIDA = ["ativo", "direcao", "motivo", "entrada", "stop"]
 
 
-def _tf_txt(tf) -> str:
-    """'60' -> '1h', '240' -> '4h', '15' -> '15m'; 'D', 'W' etc. passam sem mudar."""
-    if tf is None:
-        return ""
-    s = str(tf).strip()
-    if s.isdigit():
-        m = int(s)
-        return f"{m // 60}h" if m >= 60 and m % 60 == 0 else f"{m}m"
-    return s
+def _validar_saida(payload: dict):
+    if WEBHOOK_SHARED_SECRET and payload.get("secret") != WEBHOOK_SHARED_SECRET:
+        raise HTTPException(status_code=401, detail="Segredo do webhook invalido")
+    faltando = [c for c in CAMPOS_SAIDA if c not in payload]
+    if faltando:
+        raise HTTPException(status_code=422, detail=f"Campos faltando no payload de saida: {faltando}")
 
 
-def _fmt_preco(v) -> str:
-    """Casas por magnitude (mesma regra do f_px do Pine): >=100 -> 2; >=1 -> 4; >=0.01 -> 5; senao 8. Minimo 2 casas."""
-    x = _num(v)
-    if x is None:
-        return "-"
-    ax = abs(x)
-    casas = 2 if ax >= 100 else 4 if ax >= 1 else 5 if ax >= 0.01 else 8
-    inteiro, _, dec = f"{x:.{casas}f}".partition(".")
-    return f"{inteiro}.{dec.rstrip('0').ljust(2, '0')}"
+def _montar_mensagem_saida(payload: dict) -> str:
+    ativo = payload["ativo"]
+    direcao = "COMPRA" if str(payload["direcao"]).lower().startswith("c") else "VENDA"
+    timeframe = payload.get("timeframe")
+    cab = f"SAIDA {direcao} — {ativo} ({timeframe})" if timeframe else f"SAIDA {direcao} — {ativo}"
+    linhas = [
+        cab,
+        f"Motivo: {payload['motivo']}",
+        f"Entrada: {payload['entrada']} | Stop: {payload['stop']}",
+    ]
+    if payload.get("alvo1") is not None and payload.get("alvo2") is not None:
+        linhas.append(f"Alvo 1: {payload['alvo1']} | Alvo 2: {payload['alvo2']}")
+    pm = payload.get("preco_medio")
+    if pm:
+        linhas.append(f"Preço médio (referência): {pm}")
+    kelly = payload.get("kelly_pct")
+    if kelly is not None:
+        linhas.append(f"Kelly do plano: {float(kelly):.2f}% do capital")
+    linhas.append("Ação sugerida: avaliar encerrar o restante da posição (execução manual, sempre com você).")
+    return "\n".join(linhas)
 
 
-def _mult_r(alvo, entrada, stop):
-    """Distancia do alvo em multiplos do risco (R = |entrada - stop|); None se nao der para calcular."""
-    a, e, s = _num(alvo), _num(entrada), _num(stop)
-    if a is None or e is None or s is None or e == s:
-        return None
-    return abs(a - e) / abs(e - s)
-
-
-_NIVEL_CONF = {"GRANDE": "GRANDE", "MEDIA": "M\u00c9DIA", "BAIXA": "BAIXA"}
-_ITEM_CONF = {
-    "score": "score forte",
-    "timing": "timing confirmado",
-    "amostra": "amostra m\u00ednima",
-    "ExpR": "expect\u00e2ncia do plano > 0",
-    "prob1": "prob. do Alvo 1",
-}
+def _liberar_risco_do_ativo(ativo: str):
+    # Saida do plano libera o risco agregado daquele ativo.
+    with _lock:
+        restantes = [s for s in _janela_sinais if s["ativo"] != ativo]
+        _janela_sinais.clear()
+        _janela_sinais.extend(restantes)
 
 
 # --------------------------- NARRATIVA (numeros antes da frase, sempre) ---------------------------
 def _montar_mensagem(payload: dict, dentro_do_teto: bool, risco_pos_sinal: float) -> str:
     ativo = payload["ativo"]
-    eh_compra = payload["direcao"].lower().startswith("c") or payload["direcao"].lower() == "buy"
-    direcao = "COMPRA" if eh_compra else "VENDA"
-    icone = "\U0001f7e2" if eh_compra else "\U0001f534"
+    direcao = "COMPRA" if payload["direcao"].lower().startswith("c") or payload["direcao"].lower() == "buy" else "VENDA"
     score = payload["score"]
     timing = "confirmado" if payload["timing_confirmado"] else "pendente"
     amostra_atual = payload["amostra_atual"]
@@ -141,97 +130,54 @@ def _montar_mensagem(payload: dict, dentro_do_teto: bool, risco_pos_sinal: float
     expect = payload["expectancia"]
     kelly = payload["kelly_pct"]
     aviso_classe = payload.get("aviso_classe")  # ex.: "sem leitura fundamentalista/sazonal (softs)"
-    # Todos os campos abaixo sao OPCIONAIS (via .get()): alertas antigos (v1.4 ou anteriores) continuam funcionando.
-    tf = _tf_txt(payload.get("timeframe"))
-    tf_mare = _tf_txt(payload.get("tf_mare"))  # so existe a partir do Pine v1.5
+    # Refino P7 - todos os campos abaixo sao OPCIONAIS no payload (via .get()), para nao
+    # quebrar alertas antigos (v1 ou v1.2 anteriores a Parte 7) que ainda nao mandam esses campos.
+    timeframe = payload.get("timeframe")
 
-    # 1) cabecalho: direcao, ativo e tempo grafico analisado
-    cabecalho = f"{icone} {direcao} \u2014 {ativo}"
-    if tf:
-        cabecalho += f" | gr\u00e1fico {tf}"
-        if tf_mare:
-            cabecalho += f" (mar\u00e9 {tf_mare})"
-    if amostra_atual < amostra_exigida:
-        cabecalho += " \u2014 S\u00d3 OBSERVA\u00c7\u00c3O (amostra curta)"
-    linhas = [cabecalho]
+    cabecalho = f"{ativo} ({timeframe}) — {direcao}" if timeframe else f"{ativo} — {direcao}"
+    linhas = [
+        cabecalho,
+        # Score: na v1.2 o score e continuo e pode passar de 4 com os bonus todos ligados -
+        # rotulo sem teto para nao sugerir um limite que nao existe mais.
+        f"Score: {score:.2f} | Timing (Velez): {timing}",
+        f"Amostra: {amostra_atual}/{amostra_exigida} | Taxa histórica: {taxa:.0%} | Expectância: {expect:.2f}R",
+        f"Tamanho sugerido (Kelly ajustado): {kelly:.2f}% do capital",
+    ]
 
-    # 2) confianca: checklist do motor, NAO e probabilidade de lucro (so v1.5)
-    nivel = _NIVEL_CONF.get(str(payload.get("confianca", "")).upper())
-    if nivel:
-        pts = payload.get("confianca_pontos")
-        pts_txt = f" ({pts}/5)" if isinstance(pts, (int, float)) and not isinstance(pts, bool) else ""
-        linha = f"Confian\u00e7a: {nivel}{pts_txt} \u2014 checklist do motor, n\u00e3o \u00e9 chance de lucro."
-        faltam = [_ITEM_CONF.get(x, x) for x in str(payload.get("confianca_faltam", "")).split() if x]
-        if faltam:
-            linha += " Falta: " + ", ".join(faltam) + "."
-        linhas.append(linha)
-
-    # 3) plano de trade: entrada e stop (rompimento / lado oposto do candle do sinal)
-    entrada = _num(payload.get("entrada"))
-    stop = _num(payload.get("stop"))
+    # Refino P7 - plano de trade (Entrada/Stop/Alvo1/Alvo2 com probabilidade) e sugestao de
+    # saida parcial, a partir do payload novo do Pine (rompimento/lado oposto do candle do
+    # sinal - mecanica convergente de Velez e de um post real do Heeger/Didi sobre XAUUSD).
+    entrada = payload.get("entrada")
+    stop = payload.get("stop")
+    alvo1 = payload.get("alvo1")
+    alvo2 = payload.get("alvo2")
     if entrada is not None and stop is not None:
-        if eh_compra:
-            linhas.append(f"Entrada: comprar ao romper {_fmt_preco(entrada)} (m\u00e1xima do candle do sinal)")
-        else:
-            linhas.append(f"Entrada: vender ao romper {_fmt_preco(entrada)} (m\u00ednima do candle do sinal)")
-        linhas.append(f"Stop: {_fmt_preco(stop)} (lado oposto do mesmo candle)")
-
-    # 4) saidas parciais e saida final
-    alvo1 = _num(payload.get("alvo1"))
-    alvo2 = _num(payload.get("alvo2"))
+        linhas.append(f"Entrada (rompimento do candle do sinal): {entrada} | Stop (lado oposto do mesmo candle): {stop}")
     if alvo1 is not None and alvo2 is not None:
         amostra_alvos_suf = payload.get("amostra_alvos_suficiente", False)
         prob_alvo1 = payload.get("prob_alvo1")
         prob_alvo2 = payload.get("prob_alvo2")
         prob1_txt = f"{prob_alvo1:.0%}" if amostra_alvos_suf and prob_alvo1 is not None else "amostra insuficiente"
         prob2_txt = f"{prob_alvo2:.0%}" if amostra_alvos_suf and prob_alvo2 is not None else "amostra insuficiente"
+        linhas.append(f"Alvo 1: {alvo1} (prob. histórica: {prob1_txt}) | Alvo 2: {alvo2} (prob. histórica: {prob2_txt})")
         pct1 = payload.get("pct_parcial1")
         pct2 = payload.get("pct_parcial2")
-        r1 = _mult_r(alvo1, entrada, stop)
-        r2 = _mult_r(alvo2, entrada, stop)
-        r1_txt = f"{r1:g}R, " if r1 is not None else ""
-        r2_txt = f"{r2:g}R, " if r2 is not None else ""
-        acao1 = f" \u2192 realizar {pct1:.0f}%" if pct1 is not None else ""
-        acao2 = f" \u2192 realizar {pct2:.0f}%" if pct2 is not None else ""
-        linhas.append(f"Parcial 1 (Alvo 1): {_fmt_preco(alvo1)} ({r1_txt}prob. hist\u00f3rica: {prob1_txt}){acao1}")
-        linhas.append(f"Parcial 2 (Alvo 2): {_fmt_preco(alvo2)} ({r2_txt}prob. hist\u00f3rica: {prob2_txt}){acao2}")
         if pct1 is not None and pct2 is not None:
-            resto = max(0.0, 100.0 - float(pct1) - float(pct2))
             linhas.append(
-                f"Sa\u00edda final ({resto:.0f}%): depois da Parcial 1, stop na entrada; sair do restante quando o painel do "
-                f"indicador mostrar SA\u00cdDA (Kick ADX, ADX fraco, BB fechando, TRIX/Estoc\u00e1stico contra) ou no stop."
+                f"Sugestão de saída parcial: {pct1:.0f}% no Alvo 1, {pct2:.0f}% no Alvo 2, restante em trailing "
+                f"(sugestão própria editável — NÃO é regra documentada de Velez/Didi, só o CONCEITO de "
+                f"'sair em partes' é real)."
             )
-            linhas.append(
-                f"Parciais {pct1:.0f}/{pct2:.0f}/{resto:.0f}% e alvos em R: sugest\u00e3o pr\u00f3pria edit\u00e1vel \u2014 N\u00c3O \u00e9 regra documentada "
-                f"de Velez/Didi (s\u00f3 o CONCEITO de 'sair em partes' \u00e9 real)."
-            )
-
-    # 5) preco medio (2a entrada OPCIONAL, so v1.5)
-    preco_medio = _num(payload.get("preco_medio"))
-    if preco_medio is not None:
-        linha = f"Pre\u00e7o m\u00e9dio (opcional): {_fmt_preco(preco_medio)}, mesmo stop"
-        if entrada is not None:
-            linha += f". Dividindo o tamanho meio a meio, a posi\u00e7\u00e3o fica em \u2248 {_fmt_preco((entrada + preco_medio) / 2)}"
-        linha += ". Sugest\u00e3o pr\u00f3pria, sem teste; nunca some tamanho al\u00e9m do Kelly."
-        linhas.append(linha)
-
-    # 6) numeros do motor (como antes)
-    linhas += [
-        # Score: v1 era inteiro 0-4; na v1.2+ o score e continuo e pode passar de 4 - por isso so mostra o numero.
-        f"Score: {score:.2f} | Timing (Velez): {timing}",
-        f"Amostra: {amostra_atual}/{amostra_exigida} | Taxa hist\u00f3rica: {taxa:.0%} | Expect\u00e2ncia: {expect:.2f}R",
-        f"Tamanho sugerido (Kelly ajustado): {kelly:.2f}% do capital",
-    ]
 
     if not dentro_do_teto:
         linhas.append(
-            f"\u26a0\ufe0f Fora do teto de risco agregado ({risco_pos_sinal:.1f}% > {TETO_RISCO_AGREGADO_PCT:.1f}%) "
-            f"\u2014 sinal informativo, n\u00e3o somar posi\u00e7\u00e3o nova agora."
+            f"⚠️ Fora do teto de risco agregado ({risco_pos_sinal:.1f}% > {TETO_RISCO_AGREGADO_PCT:.1f}%) "
+            f"— sinal informativo, não somar posição nova agora."
         )
     if aviso_classe:
         linhas.append(f"Aviso: {aviso_classe}")
     if amostra_atual < amostra_exigida:
-        linhas.append("Aviso: amostra ainda insuficiente \u2014 tratar como observa\u00e7\u00e3o, n\u00e3o como sinal validado.")
+        linhas.append("Aviso: amostra ainda insuficiente — tratar como observação, não como sinal validado.")
 
     return "\n".join(linhas)
 
@@ -272,6 +218,16 @@ def _registrar_no_notion(payload: dict, mensagem: str):
 @app.post("/webhook/tradingview")
 async def webhook_tradingview(request: Request):
     payload = await request.json()
+
+    # Alerta de saida (Pine v1.6.1) - nao passa pela validacao de entrada
+    if str(payload.get("tipo", "sinal")).lower() == "saida":
+        _validar_saida(payload)
+        mensagem = _montar_mensagem_saida(payload)
+        _enviar_telegram(mensagem)
+        _registrar_no_notion(payload, mensagem)
+        _liberar_risco_do_ativo(payload["ativo"])
+        return {"status": "ok", "tipo": "saida"}
+
     _validar_payload(payload)
 
     with _lock:
