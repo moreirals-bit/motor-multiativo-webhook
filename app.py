@@ -17,9 +17,6 @@ taxa historica, expectancia, Kelly). O servidor so orquestra a ENTREGA:
   5) registro no Notion
 A execucao da ordem continua 100% manual, sempre com voce.
 
-Patch v1.6.1: alertas com tipo == "saida" sao tratados ANTES da validacao de
-entrada (nao trazem score, timing_confirmado, taxa_acerto, expectancia).
-
 Deploy sugerido: Render/Railway (free tier) ou uma VPS pequena. Nao rode isso
 no celular - precisa de processo continuo em background, o que apps moveis
 nao sustentam de forma confiavel.
@@ -61,7 +58,7 @@ def _risco_agregado_atual() -> float:
     return sum(s["kelly_pct"] for s in _janela_sinais)
 
 
-# --------------------------- VALIDACAO DO PAYLOAD (ENTRADA) ---------------------------
+# --------------------------- VALIDACAO DO PAYLOAD ---------------------------
 CAMPOS_OBRIGATORIOS = [
     "ativo", "direcao", "score", "timing_confirmado",
     "amostra_atual", "amostra_exigida", "taxa_acerto", "expectancia", "kelly_pct",
@@ -74,48 +71,6 @@ def _validar_payload(payload: dict):
         raise HTTPException(status_code=422, detail=f"Campos faltando no payload: {faltando}")
     if WEBHOOK_SHARED_SECRET and payload.get("secret") != WEBHOOK_SHARED_SECRET:
         raise HTTPException(status_code=401, detail="Segredo do webhook invalido")
-
-
-# --------------------------- VALIDACAO E MENSAGEM (SAIDA) - Patch v1.6.1 ---------------------------
-CAMPOS_SAIDA = ["ativo", "direcao", "motivo", "entrada", "stop"]
-
-
-def _validar_saida(payload: dict):
-    if WEBHOOK_SHARED_SECRET and payload.get("secret") != WEBHOOK_SHARED_SECRET:
-        raise HTTPException(status_code=401, detail="Segredo do webhook invalido")
-    faltando = [c for c in CAMPOS_SAIDA if c not in payload]
-    if faltando:
-        raise HTTPException(status_code=422, detail=f"Campos faltando no payload de saida: {faltando}")
-
-
-def _montar_mensagem_saida(payload: dict) -> str:
-    ativo = payload["ativo"]
-    direcao = "COMPRA" if str(payload["direcao"]).lower().startswith("c") else "VENDA"
-    timeframe = payload.get("timeframe")
-    cab = f"SAIDA {direcao} — {ativo} ({timeframe})" if timeframe else f"SAIDA {direcao} — {ativo}"
-    linhas = [
-        cab,
-        f"Motivo: {payload['motivo']}",
-        f"Entrada: {payload['entrada']} | Stop: {payload['stop']}",
-    ]
-    if payload.get("alvo1") is not None and payload.get("alvo2") is not None:
-        linhas.append(f"Alvo 1: {payload['alvo1']} | Alvo 2: {payload['alvo2']}")
-    pm = payload.get("preco_medio")
-    if pm:
-        linhas.append(f"Preço médio (referência): {pm}")
-    kelly = payload.get("kelly_pct")
-    if kelly is not None:
-        linhas.append(f"Kelly do plano: {float(kelly):.2f}% do capital")
-    linhas.append("Ação sugerida: avaliar encerrar o restante da posição (execução manual, sempre com você).")
-    return "\n".join(linhas)
-
-
-def _liberar_risco_do_ativo(ativo: str):
-    # Saida do plano libera o risco agregado daquele ativo.
-    with _lock:
-        restantes = [s for s in _janela_sinais if s["ativo"] != ativo]
-        _janela_sinais.clear()
-        _janela_sinais.extend(restantes)
 
 
 # --------------------------- NARRATIVA (numeros antes da frase, sempre) ---------------------------
@@ -131,14 +86,16 @@ def _montar_mensagem(payload: dict, dentro_do_teto: bool, risco_pos_sinal: float
     kelly = payload["kelly_pct"]
     aviso_classe = payload.get("aviso_classe")  # ex.: "sem leitura fundamentalista/sazonal (softs)"
     # Refino P7 - todos os campos abaixo sao OPCIONAIS no payload (via .get()), para nao
-    # quebrar alertas antigos (v1 ou v1.2 anteriores a Parte 7) que ainda nao mandam esses campos.
+    # quebrar alertas antigos (v1 ou v1.2 anteriores a Parte 7) que ainda nao mandam esses
+    # campos. Ver pagina da especificacao Pine, callout da Parte 7, para a fonte de cada um.
     timeframe = payload.get("timeframe")
 
     cabecalho = f"{ativo} ({timeframe}) — {direcao}" if timeframe else f"{ativo} — {direcao}"
     linhas = [
         cabecalho,
-        # Score: na v1.2 o score e continuo e pode passar de 4 com os bonus todos ligados -
-        # rotulo sem teto para nao sugerir um limite que nao existe mais.
+        # Score: v1 era inteiro 0-4 (por isso o rotulo antigo "Score: X/4"); na v1.2 o score e
+        # continuo e pode passar de 4 com os bonus todos ligados - rotulo corrigido para nao
+        # sugerir um teto que nao existe mais.
         f"Score: {score:.2f} | Timing (Velez): {timing}",
         f"Amostra: {amostra_atual}/{amostra_exigida} | Taxa histórica: {taxa:.0%} | Expectância: {expect:.2f}R",
         f"Tamanho sugerido (Kelly ajustado): {kelly:.2f}% do capital",
@@ -218,16 +175,6 @@ def _registrar_no_notion(payload: dict, mensagem: str):
 @app.post("/webhook/tradingview")
 async def webhook_tradingview(request: Request):
     payload = await request.json()
-
-    # Alerta de saida (Pine v1.6.1) - nao passa pela validacao de entrada
-    if str(payload.get("tipo", "sinal")).lower() == "saida":
-        _validar_saida(payload)
-        mensagem = _montar_mensagem_saida(payload)
-        _enviar_telegram(mensagem)
-        _registrar_no_notion(payload, mensagem)
-        _liberar_risco_do_ativo(payload["ativo"])
-        return {"status": "ok", "tipo": "saida"}
-
     _validar_payload(payload)
 
     with _lock:
