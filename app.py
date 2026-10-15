@@ -1,199 +1,263 @@
-"""
-Servidor de Orquestracao - Motor Multiativo de Confluencia
-============================================================
-Recebe o webhook bruto do TradingView (payload montado pelo alert() do Pine
-Script), aplica a etapa de filtro que so faz sentido fora do grafico (teto de
-risco agregado entre sinais simultaneos de ativos diferentes), monta a
-mensagem final (numeros antes da narrativa) e entrega no Telegram. Registra
-cada sinal no Notion como "sugerido / nao operado" ate voce confirmar.
-
-Este servidor NAO decide direcao nem tamanho de posicao - isso ja vem pronto
-no payload, calculado dentro do Pine Script (score de blocos, timing Velez,
-taxa historica, expectancia, Kelly). O servidor so orquestra a ENTREGA:
-  1) cascata final (teto de risco agregado da cesta)
-  2) ranking por expectancia se varios sinais chegarem juntos
-  3) narrativa (texto humano gerado a partir dos numeros)
-  4) entrega no Telegram
-  5) registro no Notion
-A execucao da ordem continua 100% manual, sempre com voce.
-
-Deploy sugerido: Render/Railway (free tier) ou uma VPS pequena. Nao rode isso
-no celular - precisa de processo continuo em background, o que apps moveis
-nao sustentam de forma confiavel.
-"""
-
+import logging
 import os
-import time
-import threading
+
 import requests
-from collections import deque
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 
-# --------------------------- CONFIGURACAO (variaveis de ambiente) ---------------------------
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]          # ex.: 8811625956:AAH82xCH-...
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]              # ex.: 824539270
-NOTION_TOKEN = os.environ.get("NOTION_TOKEN")                  # integracao interna do Notion (opcional na v1)
-NOTION_LOG_PAGE_OR_DB_ID = os.environ.get("NOTION_LOG_PAGE_OR_DB_ID")  # onde registrar os sinais
-WEBHOOK_SHARED_SECRET = os.environ.get("WEBHOOK_SHARED_SECRET", "")    # token simples no payload, evita spoof
-TETO_RISCO_AGREGADO_PCT = float(os.environ.get("TETO_RISCO_AGREGADO_PCT", "6.0"))
-JANELA_AGRUPAMENTO_SEG = float(os.environ.get("JANELA_AGRUPAMENTO_SEG", "8"))  # agrupa sinais quase simultaneos
+TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+WEBHOOK_SHARED_SECRET = os.environ.get("WEBHOOK_SHARED_SECRET", "")
 
-app = FastAPI(title="Motor Multiativo - Orquestrador")
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("oliver")
 
-# Estado em memoria dos sinais entregues na sessao/candle atual, para o teto de risco agregado.
-# Em producao real, trocar por um armazenamento persistente (ex.: SQLite) se o servidor reiniciar.
-_lock = threading.Lock()
-_janela_sinais = deque()  # cada item: {"ativo":..., "kelly_pct":..., "timestamp":...}
+app = FastAPI(title="Oliver Velez - Webhook")
 
 
-def _limpar_janela_expirada():
-    agora = time.time()
-    while _janela_sinais and agora - _janela_sinais[0]["timestamp"] > 60 * 30:
-        # limpa sinais com mais de 30 min - janela de "exposicao simultanea" considerada relevante
-        _janela_sinais.popleft()
-
-
-def _risco_agregado_atual() -> float:
-    _limpar_janela_expirada()
-    return sum(s["kelly_pct"] for s in _janela_sinais)
-
-
-# --------------------------- VALIDACAO DO PAYLOAD ---------------------------
-CAMPOS_OBRIGATORIOS = [
-    "ativo", "direcao", "score", "timing_confirmado",
-    "amostra_atual", "amostra_exigida", "taxa_acerto", "expectancia", "kelly_pct",
-]
-
-
-def _validar_payload(payload: dict):
-    faltando = [c for c in CAMPOS_OBRIGATORIOS if c not in payload]
-    if faltando:
-        raise HTTPException(status_code=422, detail=f"Campos faltando no payload: {faltando}")
-    if WEBHOOK_SHARED_SECRET and payload.get("secret") != WEBHOOK_SHARED_SECRET:
-        raise HTTPException(status_code=401, detail="Segredo do webhook invalido")
-
-
-# --------------------------- NARRATIVA (numeros antes da frase, sempre) ---------------------------
-def _montar_mensagem(payload: dict, dentro_do_teto: bool, risco_pos_sinal: float) -> str:
-    ativo = payload["ativo"]
-    direcao = "COMPRA" if payload["direcao"].lower().startswith("c") or payload["direcao"].lower() == "buy" else "VENDA"
-    score = payload["score"]
-    timing = "confirmado" if payload["timing_confirmado"] else "pendente"
-    amostra_atual = payload["amostra_atual"]
-    amostra_exigida = payload["amostra_exigida"]
-    taxa = payload["taxa_acerto"]
-    expect = payload["expectancia"]
-    kelly = payload["kelly_pct"]
-    aviso_classe = payload.get("aviso_classe")  # ex.: "sem leitura fundamentalista/sazonal (softs)"
-    # Refino P7 - todos os campos abaixo sao OPCIONAIS no payload (via .get()), para nao
-    # quebrar alertas antigos (v1 ou v1.2 anteriores a Parte 7) que ainda nao mandam esses
-    # campos. Ver pagina da especificacao Pine, callout da Parte 7, para a fonte de cada um.
-    timeframe = payload.get("timeframe")
-
-    cabecalho = f"{ativo} ({timeframe}) — {direcao}" if timeframe else f"{ativo} — {direcao}"
-    linhas = [
-        cabecalho,
-        # Score: v1 era inteiro 0-4 (por isso o rotulo antigo "Score: X/4"); na v1.2 o score e
-        # continuo e pode passar de 4 com os bonus todos ligados - rotulo corrigido para nao
-        # sugerir um teto que nao existe mais.
-        f"Score: {score:.2f} | Timing (Velez): {timing}",
-        f"Amostra: {amostra_atual}/{amostra_exigida} | Taxa histórica: {taxa:.0%} | Expectância: {expect:.2f}R",
-        f"Tamanho sugerido (Kelly ajustado): {kelly:.2f}% do capital",
-    ]
-
-    # Refino P7 - plano de trade (Entrada/Stop/Alvo1/Alvo2 com probabilidade) e sugestao de
-    # saida parcial, a partir do payload novo do Pine (rompimento/lado oposto do candle do
-    # sinal - mecanica convergente de Velez e de um post real do Heeger/Didi sobre XAUUSD).
-    entrada = payload.get("entrada")
-    stop = payload.get("stop")
-    alvo1 = payload.get("alvo1")
-    alvo2 = payload.get("alvo2")
-    if entrada is not None and stop is not None:
-        linhas.append(f"Entrada (rompimento do candle do sinal): {entrada} | Stop (lado oposto do mesmo candle): {stop}")
-    if alvo1 is not None and alvo2 is not None:
-        amostra_alvos_suf = payload.get("amostra_alvos_suficiente", False)
-        prob_alvo1 = payload.get("prob_alvo1")
-        prob_alvo2 = payload.get("prob_alvo2")
-        prob1_txt = f"{prob_alvo1:.0%}" if amostra_alvos_suf and prob_alvo1 is not None else "amostra insuficiente"
-        prob2_txt = f"{prob_alvo2:.0%}" if amostra_alvos_suf and prob_alvo2 is not None else "amostra insuficiente"
-        linhas.append(f"Alvo 1: {alvo1} (prob. histórica: {prob1_txt}) | Alvo 2: {alvo2} (prob. histórica: {prob2_txt})")
-        pct1 = payload.get("pct_parcial1")
-        pct2 = payload.get("pct_parcial2")
-        if pct1 is not None and pct2 is not None:
-            linhas.append(
-                f"Sugestão de saída parcial: {pct1:.0f}% no Alvo 1, {pct2:.0f}% no Alvo 2, restante em trailing "
-                f"(sugestão própria editável — NÃO é regra documentada de Velez/Didi, só o CONCEITO de "
-                f"'sair em partes' é real)."
-            )
-
-    if not dentro_do_teto:
-        linhas.append(
-            f"⚠️ Fora do teto de risco agregado ({risco_pos_sinal:.1f}% > {TETO_RISCO_AGREGADO_PCT:.1f}%) "
-            f"— sinal informativo, não somar posição nova agora."
-        )
-    if aviso_classe:
-        linhas.append(f"Aviso: {aviso_classe}")
-    if amostra_atual < amostra_exigida:
-        linhas.append("Aviso: amostra ainda insuficiente — tratar como observação, não como sinal validado.")
-
-    return "\n".join(linhas)
-
-
-# --------------------------- ENTREGA ---------------------------
 def _enviar_telegram(texto: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    resp = requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": texto}, timeout=10)
-    resp.raise_for_status()
+    resposta = requests.post(
+        url,
+        data={"chat_id": TELEGRAM_CHAT_ID, "text": texto},
+        timeout=10,
+    )
+    resposta.raise_for_status()
 
 
-def _registrar_no_notion(payload: dict, mensagem: str):
-    if not (NOTION_TOKEN and NOTION_LOG_PAGE_OR_DB_ID):
-        return  # registro no Notion e opcional na v1 - requer integracao interna configurada por voce
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json",
+def _oliver_preco(valor) -> str:
+    if valor is None or valor == "":
+        return "-"
+
+    texto = str(valor)
+    sinal = "-" if texto.startswith("-") else ""
+    texto = texto.lstrip("-")
+
+    inteiro, separador, decimais = texto.partition(".")
+    grupos = []
+
+    while len(inteiro) > 3:
+        grupos.insert(0, inteiro[-3:])
+        inteiro = inteiro[:-3]
+
+    grupos.insert(0, inteiro)
+    resultado = ".".join(grupos)
+
+    if separador:
+        resultado += "," + decimais
+
+    return sinal + resultado
+
+
+def _oliver_r(valor) -> str:
+    try:
+        return f"{float(valor):+.2f}".replace(".", ",") + "R"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _oliver_pct(valor) -> str:
+    try:
+        return f"{float(valor):g}".replace(".", ",") + "%"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _oliver_tf(timeframe) -> str:
+    timeframe = str(timeframe or "")
+
+    if timeframe.isdigit():
+        minutos = int(timeframe)
+        if minutos >= 60 and minutos % 60 == 0:
+            return f"{minutos // 60}h"
+        return f"{minutos}m"
+
+    return timeframe
+
+
+def _oliver_lista(valor) -> str:
+    return str(valor or "").strip("|").replace("|", ", ") or "-"
+
+
+def _oliver_mensagem(payload: dict) -> str:
+    evento = str(payload.get("evento", "")).lower()
+    preco = _oliver_preco
+
+    cabecalho = (
+        f"{payload.get('ativo', '?')} · "
+        f"{_oliver_tf(payload.get('tf'))}"
+    )
+    lado = payload.get("lado", "")
+    setup = payload.get("setup", "")
+    hora = payload.get("hora", "")
+
+    if evento == "entrada":
+        emoji = "🟢" if lado == "COMPRA" else "🔴"
+        pct1 = float(payload.get("pct1") or 0)
+        pct2 = float(payload.get("pct2") or 0)
+        pct_restante = max(0.0, 100.0 - pct1 - pct2)
+
+        return "\n".join([
+            f"{emoji} OLIVER — {lado}",
+            f"{cabecalho} · {hora}",
+            "",
+            f"Setup: {setup}",
+            f"Gatilho: {preco(payload.get('gatilho'))}",
+            f"Entrada: {preco(payload.get('entrada'))}",
+            (
+                f"Stop: {preco(payload.get('stop'))} "
+                f"(R = {preco(payload.get('r'))})"
+            ),
+            "",
+            (
+                f"🎯 A1: {preco(payload.get('alvo1'))} "
+                f"({_oliver_pct(payload.get('pct1'))})"
+            ),
+            (
+                f"🎯 A2: {preco(payload.get('alvo2'))} "
+                f"({_oliver_pct(payload.get('pct2'))})"
+            ),
+            (
+                f"🎯 A3: {preco(payload.get('alvo3'))} "
+                f"(restante {_oliver_pct(pct_restante)})"
+            ),
+            "",
+            f"Regime: {payload.get('regime', '-')}",
+            f"Contexto D/60/15: {payload.get('contexto', '-')}",
+        ])
+
+    if evento == "parcial":
+        nivel = str(payload.get("nivel", ""))
+
+        return "\n".join([
+            (
+                f"🟡 OLIVER — PARCIAL {nivel} "
+                f"({_oliver_pct(payload.get('pct'))})"
+            ),
+            f"{cabecalho} · {lado} · {setup} · {hora}",
+            (
+                f"Alvo {nivel[-1:]} atingido: "
+                f"{preco(payload.get('preco'))}"
+            ),
+            f"Stop atual: {preco(payload.get('stop'))}",
+        ])
+
+    if evento == "trailing":
+        return "\n".join([
+            "🔁 OLIVER — STOP AJUSTADO",
+            f"{cabecalho} · {lado} · {setup} · {hora}",
+            (
+                f"Stop: {preco(payload.get('stop_anterior'))} "
+                f"→ {preco(payload.get('stop'))}"
+            ),
+            (
+                f"Perfil: {payload.get('perfil', '-')} "
+                f"· Entrada: {preco(payload.get('entrada'))}"
+            ),
+        ])
+
+    if evento == "saida":
+        motivo = str(payload.get("motivo", ""))
+        titulo = {
+            "ALVO3": "✅ OLIVER — SAÍDA ALVO 3",
+            "STOP": "⛔ OLIVER — STOP",
+            "STOP_AMBIGUO_PRIORIZADO": (
+                "⛔ OLIVER — STOP (AMBÍGUO, PRIORIZADO)"
+            ),
+        }.get(motivo, f"⏹ OLIVER — SAÍDA ({motivo})")
+
+        def marca(valor):
+            return "✔" if valor else "✘"
+
+        return "\n".join([
+            titulo,
+            f"{cabecalho} · {lado} · {setup} · {hora}",
+            (
+                f"Entrada: {preco(payload.get('entrada'))} "
+                f"→ Saída: {preco(payload.get('saida'))}"
+            ),
+            (
+                f"Parciais: A1 {marca(payload.get('p1'))} "
+                f"A2 {marca(payload.get('p2'))}"
+            ),
+            (
+                "Resultado do restante: "
+                f"{_oliver_r(payload.get('r_restante'))}"
+            ),
+            (
+                "Resultado com parciais: "
+                f"{_oliver_r(payload.get('r_ponderado'))}"
+            ),
+        ])
+
+    if evento == "conflito":
+        modo = payload.get("modo", "Bloquear")
+        acao = (
+            "Bloqueado — verificar manualmente"
+            if modo == "Bloquear"
+            else f"Resolvido por: {modo}"
+        )
+
+        return "\n".join([
+            "⚠️ OLIVER — CONFLITO",
+            f"{cabecalho} · {hora}",
+            (
+                f"Compra: {_oliver_lista(payload.get('compras'))} "
+                f"| Venda: {_oliver_lista(payload.get('vendas'))}"
+            ),
+            acao,
+        ])
+
+    return f"OLIVER — evento desconhecido: {evento}"
+
+
+def _oliver_entregar(texto: str):
+    try:
+        _enviar_telegram(texto)
+    except Exception:
+        log.exception("Falha ao enviar mensagem Oliver ao Telegram")
+
+
+@app.post("/webhook/oliver")
+async def webhook_oliver(
+    request: Request,
+    background: BackgroundTasks,
+):
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON inválido")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="O payload precisa ser um objeto JSON",
+        )
+
+    if WEBHOOK_SHARED_SECRET and payload.get("secret") != WEBHOOK_SHARED_SECRET:
+        raise HTTPException(
+            status_code=401,
+            detail="Segredo do webhook inválido",
+        )
+
+    if "evento" not in payload:
+        raise HTTPException(
+            status_code=422,
+            detail="Campo 'evento' ausente",
+        )
+
+    log.info(
+        "Oliver recebido: evento=%s ativo=%s",
+        payload.get("evento"),
+        payload.get("ativo", "não informado"),
+    )
+
+    mensagem = _oliver_mensagem(payload)
+    background.add_task(_oliver_entregar, mensagem)
+
+    return {
+        "status": "ok",
+        "evento": payload["evento"],
     }
-    titulo_texto = f"{payload['ativo']} - {payload['direcao']} - sugerido"
-    bloco_titulo = {"text": {"content": titulo_texto}}
-    bloco_corpo = {"text": {"content": mensagem}}
-    corpo = {
-        "parent": {"page_id": NOTION_LOG_PAGE_OR_DB_ID},
-        "properties": {"title": [bloco_titulo]},
-        "children": [
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {"rich_text": [bloco_corpo]},
-            }
-        ],
-    }
-    requests.post("https://api.notion.com/v1/pages", headers=headers, json=corpo, timeout=10)
-
-
-# --------------------------- ENDPOINT PRINCIPAL ---------------------------
-@app.post("/webhook/tradingview")
-async def webhook_tradingview(request: Request):
-    payload = await request.json()
-    _validar_payload(payload)
-
-    with _lock:
-        _limpar_janela_expirada()
-        risco_antes = _risco_agregado_atual()
-        risco_depois = risco_antes + float(payload["kelly_pct"])
-        dentro_do_teto = risco_depois <= TETO_RISCO_AGREGADO_PCT
-        if dentro_do_teto:
-            _janela_sinais.append({
-                "ativo": payload["ativo"],
-                "kelly_pct": float(payload["kelly_pct"]),
-                "timestamp": time.time(),
-            })
-
-    mensagem = _montar_mensagem(payload, dentro_do_teto, risco_depois)
-    _enviar_telegram(mensagem)
-    _registrar_no_notion(payload, mensagem)
-
-    return {"status": "ok", "dentro_do_teto": dentro_do_teto, "risco_agregado_pct": round(risco_depois, 2)}
 
 
 @app.get("/health")
