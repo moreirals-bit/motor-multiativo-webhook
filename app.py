@@ -1,11 +1,11 @@
 """
-Servidor de Orquestracao - Motor Multiativo de Confluencia + Oliver v0.3
+Servidor de Orquestracao - Motor Multiativo + Oliver v0.4 compativel
 ========================================================================
 Recebe webhooks do TradingView (alert() do Pine Script) e entrega no Telegram.
 
 Endpoints:
   POST /webhook/tradingview  -> Motor Multiativo (sinal + saida)
-  POST /webhook/oliver       -> Oliver Velez v0.3 (entrada, parcial, trailing, saida, conflito)
+  POST /webhook/oliver       -> Oliver Velez v0.3/v0.4 (entrada, parcial, trailing, saida, conflito)
   GET  /health
 
 A execucao da ordem continua 100% manual, sempre com voce.
@@ -373,6 +373,14 @@ def _oliver_mensagem(p: dict) -> str:
             f"Regime: {p.get('regime', '-')}",
             f"Contexto D/60/15: {p.get('contexto', '-')}",
         ]
+        # v0.4: campos opcionais enviados no evento de entrada. Mantem compatibilidade
+        # com os payloads v0.3, que nao incluem ADX nem a expansao das Bandas de Bollinger.
+        adx = _oliver_num(p.get("adx"))
+        bb_abre = _oliver_num(p.get("bb_abre"))
+        if adx is not None or bb_abre is not None:
+            adx_txt = f"{adx:.2f}".replace(".", ",") if adx is not None else "-"
+            bb_abre_txt = f"x{bb_abre:.2f}".replace(".", ",") if bb_abre is not None else "-"
+            linhas.append(f"ADX: {adx_txt} | BB abre: {bb_abre_txt}")
         if p.get("confianca"):
             linhas.append(f"Confian\u00e7a: {p['confianca']} (contagem de crit\u00e9rios, n\u00e3o probabilidade)")
         linhas += _oliver_linhas_probabilidade(p)
